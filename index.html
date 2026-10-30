@@ -1,0 +1,449 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kickoff Runner</title>
+<style>
+  html,body{margin:0;height:100%;background:#0e1a12;color:#e8f2ea;font-family:system-ui,sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:16px;box-sizing:border-box}
+  canvas{width:100%;max-width:900px;image-rendering:pixelated;border-radius:8px;touch-action:none;display:block;box-shadow:0 8px 30px rgba(0,0,0,.5)}
+  p{margin:0;opacity:.7;font-size:13px;text-align:center}
+  kbd{background:#24382b;border-radius:4px;padding:1px 6px;font-family:inherit}
+</style>
+</head>
+<body>
+<canvas id="c" width="900" height="260"></canvas>
+<p><kbd>Space</kbd>/<kbd>↑</kbd>/tap to jump &nbsp;·&nbsp; <kbd>↓</kbd>/swipe down to slide &nbsp;·&nbsp; <kbd>F</kbd>/swipe up to shoot &nbsp;·&nbsp; <kbd>P</kbd> to pause</p>
+<script>
+const cv = document.getElementById('c'), cx = cv.getContext('2d');
+const W = 900, H = 260, GROUND = 214, PX = 82;
+
+// Physics: peak jump height = JUMP_V^2 / (2*GRAV), about 111 px. Air time is about 0.58 s.
+const GRAV = 2600, JUMP_V = 760;
+const START_SPEED = 380, MAX_SPEED = 950, ACCEL = 9;   // speed in px/s, ACCEL is px/s gained per second
+const GOAL_EVERY = 500, NIGHT_EVERY = 1000;
+// Shooting: a goal appears every CHANCE_EVERY points. Only shots from inside the box are on target.
+const BOX = 360, SHOT_SPEED = 950, CHANCE_FIRST = 250, CHANCE_EVERY = 400, GOAL_BONUS = 100;
+const LOW_SHOT = 12, HIGH_SHOT = 46, BAR = 64;   // heights above the grass
+
+const KIT = { shirt: '#e63946', shorts: '#f5f5f5', sock: '#e63946', skin: '#c68642', hair: '#2b1d14', boot: '#111' };
+const OPP = { shirt: '#1d4ed8', shorts: '#111827', sock: '#1d4ed8', skin: '#8d5524', hair: '#111' };
+const KEEPER = { shirt: '#facc15', shorts: '#111827', sock: '#facc15', skin: '#e0ac69', hair: '#5a3825', glove: '#22c55e' };
+const CROWD = ['#e63946', '#f1faee', '#1d4ed8', '#ffd166', '#2a9d8f', '#f4a261', '#e9c46a'];
+
+let state, best = 0, paused = false;
+try { best = +localStorage.getItem('kickoffBest') || 0; } catch (e) {}
+const keys = { down: false };
+const DEMO = location.hash.startsWith('#demo');
+
+function reset() {
+  state = {
+    mode: 'ready', speed: START_SPEED, dist: 0, score: 0, bonus: 0, nextGoal: GOAL_EVERY, nextChance: CHANCE_FIRST,
+    p: { y: 0, vy: 0, slide: false, air: false, run: 0, slideT: 0 },
+    obs: [], nextGap: 500, nightMix: 0, flash: 0, flashText: '', flashColor: '#ffd166', shake: 0, overAt: 0,
+    shot: null, goals: 0, auto: DEMO
+  };
+  if (location.hash === '#demo-night') { state.dist = NIGHT_EVERY * 40; state.score = NIGHT_EVERY; state.nextGoal = NIGHT_EVERY + GOAL_EVERY; state.nextChance = NIGHT_EVERY + 60; state.nightMix = 1; }
+  if (location.hash === '#demo-goal') state.nextChance = 0;
+}
+reset();
+if (DEMO) state.mode = 'run';
+
+// ---------- audio ----------
+let ac = null;
+function beep(f, d, type) {
+  try {
+    ac = ac || new (window.AudioContext || window.webkitAudioContext)();
+    const o = ac.createOscillator(), g = ac.createGain();
+    o.type = type || 'square'; o.frequency.value = f;
+    g.gain.setValueAtTime(0.05, ac.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + d);
+    o.connect(g).connect(ac.destination); o.start(); o.stop(ac.currentTime + d);
+  } catch (e) {}
+}
+function whistle() { beep(1900, 0.18, 'sine'); setTimeout(() => beep(1900, 0.45, 'sine'), 230); }
+
+// ---------- input ----------
+function start() {
+  if (state.mode === 'over') { if (performance.now() - state.overAt < 450) return; reset(); }
+  if (state.mode === 'ready') beep(1900, 0.3, 'sine');
+  state.mode = 'run';
+}
+function jump() {
+  if (state.mode !== 'run') { start(); return; }
+  const p = state.p;
+  if (!p.air) { p.vy = JUMP_V; p.air = true; p.slideT = 0; beep(520, 0.08); }
+}
+// Shot height comes from the player: on the ground = low, mid-jump = high.
+// From outside the box it always sails over the bar.
+function shoot() {
+  const s = state;
+  if (s.mode !== 'run' || s.shot) return;
+  const g = s.obs.find(o => o.type === 'goal' && !o.shotTaken && o.x - PX > 60);
+  if (!g) return;
+  g.shotTaken = true;
+  const far = g.x - PX > BOX, y0 = s.p.y + 6;
+  s.shot = { x: PX + 27, x0: PX + 27, y: y0, y0, ty: far ? 95 : s.p.y > 20 ? HIGH_SHOT : LOW_SHOT,
+             g, done: false, after: 0, vx: 0, vy: 0 };
+  beep(220, 0.1, 'triangle');
+}
+function keeperHigh(g) { return Math.floor(g.t / g.period) % 2 === 1; }
+function setFlash(text, color) { state.flash = 1.2; state.flashText = text; state.flashColor = color || '#ffd166'; }
+function slide(touch) {
+  if (state.mode !== 'run') return;
+  if (touch) state.p.slideT = 0.55; else keys.down = true;
+}
+addEventListener('keydown', e => {
+  if (['Space', 'ArrowUp', 'KeyW'].includes(e.code)) { e.preventDefault(); if (!e.repeat) jump(); }
+  else if (['ArrowDown', 'KeyS'].includes(e.code)) { e.preventDefault(); slide(false); }
+  else if (['KeyF', 'KeyX', 'Enter'].includes(e.code)) { e.preventDefault(); if (!e.repeat) shoot(); }
+  else if (e.code === 'KeyP' && state.mode === 'run') paused = !paused;
+});
+addEventListener('keyup', e => { if (['ArrowDown', 'KeyS'].includes(e.code)) keys.down = false; });
+let ty = null, swiped = false;
+cv.addEventListener('touchstart', e => { e.preventDefault(); ty = e.touches[0].clientY; swiped = false; }, { passive: false });
+cv.addEventListener('touchmove', e => { e.preventDefault(); if (swiped) return;
+  const dy = e.touches[0].clientY - ty;
+  if (dy > 30) { swiped = true; slide(true); } else if (dy < -30) { swiped = true; shoot(); } }, { passive: false });
+cv.addEventListener('touchend', e => { e.preventDefault(); if (!swiped) jump(); }, { passive: false });
+cv.addEventListener('mousedown', () => jump());
+addEventListener('blur', () => { if (state.mode === 'run') paused = true; });
+
+// ---------- obstacles ----------
+// Which challenge comes next, given the score. The mix ramps up so a new player
+// learns "jump" before "slide" is ever asked of them.
+function chooseObstacle(score) {
+  const r = Math.random();
+  if (score < 150) return r < 0.6 ? 'cone' : 'defender';
+  if (score < 350) return r < 0.3 ? 'cone' : r < 0.65 ? 'defender' : 'slider';
+  if (score < 600) return r < 0.2 ? 'cone' : r < 0.45 ? 'defender' : r < 0.75 ? 'slider' : 'ball';
+  return r < 0.15 ? 'cones' : r < 0.4 ? 'defender' : r < 0.7 ? 'slider' : 'ball';
+}
+function makeObstacle(type) {
+  const o = { type, x: W + 20, vx: 0, w: 16, h: 24, t: 0 };
+  if (type === 'cones') { o.w = 40; o.h = 24; }
+  if (type === 'defender') { o.w = 22; o.h = 46; }
+  if (type === 'slider') { o.w = 50; o.h = 18; o.vx = 130; }
+  if (type === 'ball') { o.w = 14; o.h = 14; o.vx = 220; o.y = GROUND - 41; }  // head height: must slide (or jump)
+  if (o.y === undefined) o.y = GROUND - o.h;
+  return o;
+}
+function makeGoal(score) {
+  // the keeper switches between guarding low and high, and switches faster later in the run
+  return { type: 'goal', x: W + 20, vx: 0, w: 40, h: BAR, y: GROUND - BAR, t: 0,
+           period: Math.max(0.38, 0.65 - score / 5000), shotTaken: false };
+}
+
+function playerBox() {
+  const p = state.p, h = p.slide ? 20 : 40, w = p.slide ? 34 : 20;
+  return { x: PX, y: GROUND - p.y - h, w, h };
+}
+function hit(a, b, inset) {
+  return a.x + inset < b.x + b.w - inset && a.x + a.w - inset > b.x + inset &&
+         a.y + inset < b.y + b.h - inset && a.y + a.h - inset > b.y + inset;
+}
+
+// ---------- update ----------
+function update(dt) {
+  const s = state;
+  s.flash = Math.max(0, s.flash - dt);
+  s.shake = Math.max(0, s.shake - dt);
+  s.nightMix += ((Math.floor(s.score / NIGHT_EVERY) % 2) - s.nightMix) * Math.min(1, dt * 1.2);
+  if (s.mode !== 'run') return;
+
+  s.speed = Math.min(MAX_SPEED, s.speed + ACCEL * dt);
+  const dx = s.speed * dt;
+  s.dist += dx;
+  s.score = Math.floor(s.dist / 40) + s.bonus;
+  if (s.score >= s.nextGoal) { setFlash(`${s.nextGoal}!`, '#f1faee'); s.nextGoal += GOAL_EVERY; beep(660, 0.12); setTimeout(() => beep(990, 0.25), 120); }
+
+  if (s.auto) autopilot();
+
+  const p = s.p;
+  if (p.slideT > 0) p.slideT -= dt;
+  const wantSlide = keys.down || p.slideT > 0;
+  if (p.air) {
+    p.vy -= (GRAV + (wantSlide ? GRAV * 1.6 : 0)) * dt;   // holding down mid-air = fast fall
+    p.y += p.vy * dt;
+    if (p.y <= 0) { p.y = 0; p.vy = 0; p.air = false; }
+  }
+  p.slide = !p.air && wantSlide;
+  p.run += dt * s.speed / 45;
+
+  s.nextGap -= dx;
+  if (s.nextGap <= 0) {
+    if (s.score >= s.nextChance) {
+      s.obs.push(makeGoal(s.score));
+      s.nextChance = s.score + CHANCE_EVERY;
+      s.nextGap = W + 250;   // nothing else spawns until the goal has gone past
+    } else {
+      s.obs.push(makeObstacle(chooseObstacle(s.score)));
+      s.nextGap = s.speed * 0.75 + 120 + Math.random() * s.speed * 0.9;
+    }
+  }
+  for (const o of s.obs) { o.x -= dx + o.vx * dt; o.t += dt; }
+  s.obs = s.obs.filter(o => o.x + o.w > -60);
+  updateShot(dt, dx);
+
+  const pb = playerBox();
+  for (const o of s.obs) if (o.type !== 'goal' && hit(pb, o, 3)) { gameOver(o); break; }
+}
+function updateShot(dt, dx) {
+  const s = state, sh = s.shot;
+  if (!sh) return;
+  const g = sh.g;
+  if (!sh.done) {
+    sh.x += SHOT_SPEED * dt;
+    const k = Math.min(1, (sh.x - sh.x0) / Math.max(1, g.x - 12 - sh.x0));
+    sh.y = sh.y0 + (sh.ty - sh.y0) * k;
+    if (k < 1) return;
+    sh.done = true;
+    if (sh.ty > BAR) { setFlash('OVER THE BAR!', '#f1faee'); sh.vx = 300; sh.vy = 250; beep(160, 0.3, 'sawtooth'); }
+    else if ((sh.ty > 28) === keeperHigh(g)) { setFlash('SAVED!', '#facc15'); sh.vx = -260; sh.vy = 260; beep(180, 0.25, 'sawtooth'); }
+    else {
+      s.bonus += GOAL_BONUS; s.goals++; sh.scored = true; sh.vx = 160; sh.vy = 0;
+      setFlash('GOAL!  +' + GOAL_BONUS, '#ffd166');
+      beep(660, 0.12); setTimeout(() => beep(880, 0.12), 110); setTimeout(() => beep(1320, 0.35), 220);
+    }
+    return;
+  }
+  sh.after += dt;
+  sh.x += sh.vx * dt - dx;
+  sh.vy -= GRAV * 0.5 * dt;
+  sh.y = Math.max(6, sh.y + sh.vy * dt);
+  if (sh.scored) sh.x = Math.min(sh.x, g.x + 24);   // caught by the net
+  if (sh.after > 0.9) s.shot = null;                // a new ball arrives at the striker's feet
+}
+function gameOver(o) {
+  const s = state;
+  s.mode = 'over'; s.overAt = performance.now(); s.shake = 0.3;
+  s.reason = o.type === 'ball' ? 'HEADED OUT!' : o.type.startsWith('cone') ? 'TRIPPED!' : 'TACKLED!';
+  whistle();
+  if (s.score > best) { best = s.score; try { localStorage.setItem('kickoffBest', best); } catch (e) {} }
+  if (s.auto) setTimeout(() => { reset(); state.mode = 'run'; }, 1500);
+}
+function autopilot() {
+  const s = state, o = s.obs.find(o => o.type !== 'goal' && o.x + o.w > PX);
+  keys.down = false;
+  const g = s.obs.find(o => o.type === 'goal' && !o.shotTaken);
+  if (g && g.x - PX < BOX - 40 && g.x - PX > 150) {
+    const kh = keeperHigh(g);
+    if (kh && !s.p.air) shoot();                       // keeper up: go low
+    else if (!kh && s.p.air && s.p.y > 20) shoot();    // keeper down: go high
+    else if (!kh && !s.p.air) { s.p.vy = JUMP_V; s.p.air = true; }
+  }
+  if (!o) return;
+  const gap = o.x - (PX + 20);
+  if (o.type === 'ball') { if (gap < 160) keys.down = true; }
+  else if (gap < s.speed * 0.16 + 10 && !s.p.air) { s.p.vy = JUMP_V; s.p.air = true; }
+}
+
+// ---------- drawing ----------
+const R = (x, y, w, h, c) => { cx.fillStyle = c; cx.fillRect(Math.round(x), Math.round(y), w, h); };
+function lerpC(a, b, t) {
+  const pa = parseInt(a.slice(1), 16), pb = parseInt(b.slice(1), 16);
+  const ch = sh => (((pa >> sh) & 255) + ((((pb >> sh) & 255) - ((pa >> sh) & 255)) * t)) | 0;
+  return `rgb(${ch(16)},${ch(8)},${ch(0)})`;
+}
+
+function drawBackground() {
+  const s = state, m = s.nightMix, d = s.dist;
+  R(0, 0, W, 60, lerpC('#8fd3f4', '#0b1430', m));
+  if (m > 0.05) {  // stars
+    cx.globalAlpha = m;
+    for (let i = 0; i < 40; i++) R((i * 97) % W, (i * 37) % 50 + 4, 2, 2, '#fff');
+    cx.globalAlpha = 1;
+  }
+  // stand + crowd (slow parallax; the crowd jumps on a goal)
+  R(0, 50, W, 72, lerpC('#3b4a5c', '#1c2430', m));
+  const off = (d * 0.15) % 12, hop = s.flash > 0 ? Math.abs(Math.sin(s.flash * 18)) * 4 : 0;
+  for (let row = 0; row < 5; row++) {
+    for (let i = -1; i < W / 12 + 1; i++) {
+      const idx = i + Math.floor(d * 0.15 / 12);
+      const c = CROWD[Math.abs(idx * 7 + row * 3) % CROWD.length];
+      const y = 56 + row * 13 - ((idx + row) % 2 ? hop : 0);
+      R(i * 12 - off + (row % 2) * 6, y, 6, 4, '#d9a066');   // head
+      R(i * 12 - off + (row % 2) * 6 - 1, y + 4, 8, 6, c);   // shirt
+    }
+  }
+  // advertising boards
+  const bo = (d * 0.6) % 180;
+  for (let i = -1; i < W / 180 + 2; i++) {
+    const idx = i + Math.floor(d * 0.6 / 180);
+    R(i * 180 - bo, 122, 178, 18, ['#ffd166', '#1d3557', '#e63946', '#2a9d8f'][Math.abs(idx) % 4]);
+    cx.fillStyle = Math.abs(idx) % 4 === 0 ? '#1d3557' : '#fff';
+    cx.font = 'bold 12px monospace';
+    cx.fillText(['KICKOFF', 'GOAL FM', 'NET+', 'PITCH CO'][Math.abs(idx) % 4], i * 180 - bo + 50, 135);
+  }
+  // pitch with mowing stripes
+  const so = d % 140;
+  for (let i = -1; i < W / 70 + 2; i++) R(i * 70 - so, 140, 70, H - 140, (i + Math.floor(d / 70)) % 2 ? '#3c9a3c' : '#358a35');
+  R(0, GROUND + 1, W, 3, '#f4f4f4');   // touchline
+}
+
+function drawNight() {
+  const m = state.nightMix;
+  if (m < 0.02) return;
+  cx.fillStyle = `rgba(5,10,30,${0.45 * m})`; cx.fillRect(0, 0, W, H);
+  for (const x of [140, 760]) {
+    R(x - 2, 14, 4, 40, '#555');
+    R(x - 14, 6, 28, 10, '#ccc');
+    const g = cx.createRadialGradient(x, 11, 2, x, 11, 200);
+    g.addColorStop(0, `rgba(255,250,220,${0.55 * m})`); g.addColorStop(1, 'rgba(255,250,220,0)');
+    cx.fillStyle = g; cx.fillRect(x - 200, 0, 400, H);
+  }
+}
+
+function drawBall(x, y, r, spin) {
+  cx.fillStyle = '#fff'; cx.beginPath(); cx.arc(x, y, r, 0, Math.PI * 2); cx.fill();
+  cx.strokeStyle = '#222'; cx.lineWidth = 1; cx.stroke();
+  cx.fillStyle = '#222';
+  cx.beginPath(); cx.arc(x + Math.cos(spin) * r * 0.45, y + Math.sin(spin) * r * 0.45, r * 0.35, 0, Math.PI * 2); cx.fill();
+}
+
+function drawPlayer() {
+  const s = state, p = s.p, k = KIT, x = PX;
+  const spin = -s.dist / 8;
+  if (p.slide) {
+    const t = GROUND - 20;
+    R(x - 2, t + 14, 8, 4, k.skin);                   // trailing arm on the grass
+    R(x, t, 10, 4, k.hair); R(x, t + 3, 10, 8, k.skin);
+    R(x + 8, t + 6, 14, 10, k.shirt);
+    R(x + 20, t + 10, 8, 7, k.shorts);
+    R(x + 26, t + 14, 10, 5, k.sock); R(x + 35, t + 14, 4, 5, k.boot);
+    if (!s.shot) drawBall(x + 48, GROUND - 6, 6, spin);
+    return;
+  }
+  const t = GROUND - p.y - 40, f = Math.floor(p.run) % 2;
+  R(x + 5, t, 11, 4, k.hair);
+  R(x + 5, t + 3, 11, 9, k.skin); R(x + 13, t + 6, 2, 2, '#111');
+  R(x + 3, t + 12, 15, 14, k.shirt); R(x + 7, t + 12, 7, 2, '#fff');
+  R(x + (p.air ? 16 : f ? 0 : 15), t + 13, 4, 10, k.skin);   // swinging arm
+  R(x + 3, t + 26, 15, 6, k.shorts);
+  if (p.air) {
+    R(x + 3, t + 31, 6, 6, k.sock); R(x + 12, t + 30, 6, 6, k.sock);
+    R(x + 3, t + 36, 6, 2, k.boot); R(x + 12, t + 35, 6, 2, k.boot);
+    if (!s.shot) drawBall(x + 24, GROUND - p.y - 6, 6, spin);     // flicked up with the player
+  } else {
+    R(x + (f ? 2 : 5), t + 32, 5, 6, k.sock); R(x + (f ? 13 : 10), t + 32, 5, 6, k.sock);
+    R(x + (f ? 1 : 4), t + 38, 7, 2, k.boot); R(x + (f ? 13 : 10), t + 38, 7, 2, k.boot);
+    if (!s.shot) drawBall(x + 27 + Math.sin(p.run * Math.PI) * 4, GROUND - 6, 6, spin);   // dribble
+  }
+}
+
+function drawObstacle(o) {
+  const k = OPP, x = o.x, y = o.y;
+  if (o.type === 'cone' || o.type === 'cones') {
+    const n = o.type === 'cones' ? 2 : 1;
+    for (let i = 0; i < n; i++) {
+      const cxx = x + i * 24;
+      cx.fillStyle = '#ff7b00'; cx.beginPath();
+      cx.moveTo(cxx + 8, y); cx.lineTo(cxx + 16, y + 22); cx.lineTo(cxx, y + 22); cx.fill();
+      R(cxx + 4, y + 10, 8, 3, '#fff'); R(cxx - 2, y + 21, 20, 3, '#ff7b00');
+    }
+  } else if (o.type === 'defender') {
+    R(x + 5, y, 12, 4, k.hair); R(x + 5, y + 3, 12, 9, k.skin); R(x + 6, y + 6, 2, 2, '#fff');
+    R(x - 6, y + 13, 34, 4, k.skin);                  // arms out wide, making a wall
+    R(x + 3, y + 12, 16, 15, k.shirt);
+    R(x + 3, y + 27, 16, 6, k.shorts);
+    R(x + 4, y + 33, 5, 11, k.sock); R(x + 13, y + 33, 5, 11, k.sock);
+    R(x + 3, y + 43, 7, 3, '#111'); R(x + 12, y + 43, 7, 3, '#111');
+  } else if (o.type === 'slider') {
+    // studs-first slide toward the player, kicking up turf
+    R(x, y + 11, 4, 5, '#111'); R(x + 3, y + 11, 12, 5, k.sock);
+    R(x + 14, y + 8, 9, 8, k.shorts); R(x + 22, y + 4, 15, 11, k.shirt);
+    R(x + 36, y + 2, 10, 9, k.skin); R(x + 37, y, 10, 4, k.hair); R(x + 44, y + 12, 8, 4, k.skin);
+    for (let i = 0; i < 4; i++) R(x + 50 + i * 7 + (o.t * 60 % 7), y + 10 - i * 2, 3, 3, '#5b3a1e');
+  } else if (o.type === 'goal') {
+    const inBox = !o.shotTaken && x - PX <= BOX && x - PX > 60;
+    R(x - BOX, 146, 3, GROUND - 146, inBox ? '#ffd166' : 'rgba(255,255,255,.75)');   // edge of the box
+    cx.strokeStyle = 'rgba(255,255,255,.45)'; cx.lineWidth = 1;
+    for (let i = 6; i < 34; i += 6) { cx.beginPath(); cx.moveTo(x + i, GROUND - BAR + 2); cx.lineTo(x + i, GROUND); cx.stroke(); }
+    for (let j = 8; j < BAR; j += 8) { cx.beginPath(); cx.moveTo(x + 2, GROUND - j); cx.lineTo(x + 32, GROUND - j); cx.stroke(); }
+    R(x + 30, GROUND - BAR + 4, 3, BAR - 4, '#cfcfcf');   // back post
+    R(x, GROUND - BAR, 34, 4, '#fff');                     // crossbar
+    R(x, GROUND - BAR, 4, BAR, '#fff');                    // front post
+    drawKeeper(x - 20, keeperHigh(o));
+  } else if (o.type === 'ball') {
+    cx.strokeStyle = 'rgba(255,255,255,.6)'; cx.lineWidth = 2;
+    for (let i = 0; i < 3; i++) { cx.beginPath(); cx.moveTo(x + 18, y + 3 + i * 4); cx.lineTo(x + 30 + i * 6, y + 3 + i * 4); cx.stroke(); }
+    drawBall(x + 7, y + 7, 7, o.t * 20);
+  }
+}
+
+function drawKeeper(kx, high) {
+  const k = KEEPER;
+  if (high) {   // leaping, gloves up: covers the top half of the goal
+    const t = GROUND - BAR;
+    R(kx - 2, t, 4, 6, k.glove); R(kx + 16, t, 4, 6, k.glove);
+    R(kx, t + 5, 3, 10, k.shirt); R(kx + 15, t + 5, 3, 10, k.shirt);
+    R(kx + 4, t + 6, 10, 4, k.hair); R(kx + 4, t + 9, 10, 7, k.skin);
+    R(kx + 2, t + 16, 14, 12, k.shirt); R(kx + 2, t + 28, 14, 5, k.shorts);
+    R(kx + 2, t + 33, 5, 8, k.sock); R(kx + 11, t + 33, 5, 8, k.sock);
+  } else {      // crouched, gloves low and wide: covers the bottom half
+    const t = GROUND - 32;
+    R(kx + 4, t, 10, 4, k.hair); R(kx + 4, t + 3, 10, 7, k.skin);
+    R(kx + 2, t + 10, 14, 11, k.shirt);
+    R(kx - 6, t + 14, 8, 3, k.shirt); R(kx + 16, t + 14, 8, 3, k.shirt);
+    R(kx - 9, t + 13, 4, 6, k.glove); R(kx + 23, t + 13, 4, 6, k.glove);
+    R(kx + 2, t + 21, 14, 4, k.shorts);
+    R(kx, t + 25, 6, 7, k.sock); R(kx + 12, t + 25, 6, 7, k.sock);
+  }
+}
+
+function centerText(txt, y, size, color) {
+  cx.font = `900 ${size}px system-ui, sans-serif`; cx.textAlign = 'center';
+  cx.lineWidth = 5; cx.strokeStyle = 'rgba(0,0,0,.6)'; cx.strokeText(txt, W / 2, y);
+  cx.fillStyle = color; cx.fillText(txt, W / 2, y); cx.textAlign = 'left';
+}
+
+function drawHUD() {
+  const s = state;
+  cx.font = 'bold 18px monospace'; cx.textAlign = 'right';
+  const pad = n => String(n).padStart(5, '0');
+  cx.fillStyle = 'rgba(0,0,0,.45)'; cx.fillRect(W - 230, 8, 222, 28);
+  cx.fillStyle = '#ffd166'; cx.fillText(`HI ${pad(best)}  ${pad(s.score)}`, W - 16, 28);
+  cx.textAlign = 'left';
+  if (s.goals) { cx.fillStyle = 'rgba(0,0,0,.45)'; cx.fillRect(8, 8, 110, 28); cx.fillStyle = '#ffd166'; cx.fillText(`GOALS ${s.goals}`, 16, 28); }
+  if (s.flash > 0) centerText(s.flashText, 100 - (1.2 - s.flash) * 10, 40 + (1.2 - s.flash) * 16, s.flashColor);
+  const g = s.mode === 'run' && !s.shot && s.obs.find(o => o.type === 'goal' && !o.shotTaken && o.x - PX > 60);
+  if (g && s.flash <= 0) {
+    if (g.x - PX <= BOX) centerText('SHOOT!  F / swipe up  ·  jump first for a high shot', 244, 16, '#ffd166');
+    else centerText('chance coming, get into the box', 244, 16, '#f1faee');
+  }
+  if (s.mode === 'ready') {
+    centerText('KICKOFF RUNNER', 90, 40, '#fff');
+    centerText('press Space or tap to kick off', 120, 18, '#f1faee');
+  }
+  if (s.mode === 'over') {
+    centerText(s.reason, 92, 44, '#ff4d5a');
+    centerText('Space or tap for a rematch', 122, 18, '#f1faee');
+  }
+  if (paused) centerText('PAUSED', 100, 40, '#fff');
+}
+
+function draw() {
+  const s = state;
+  cx.save();
+  if (s.shake > 0) cx.translate((Math.random() - 0.5) * 8, (Math.random() - 0.5) * 6);
+  drawBackground();
+  drawNight();
+  for (const o of s.obs) drawObstacle(o);
+  drawPlayer();
+  if (s.shot) drawBall(s.shot.x, GROUND - s.shot.y, 6, s.shot.x / 5);
+  cx.restore();
+  drawHUD();
+}
+
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  if (!paused) update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
